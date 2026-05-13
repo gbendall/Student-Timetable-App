@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Ashcombe School Timetable</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f7f7f8; }
+    @keyframes pulseNow { 0% { transform: scale(1); } 50% { transform: scale(1.02); } 100% { transform: scale(1); } }
+    .current-lesson-pulse { animation: pulseNow 2.6s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useState } = React;
+
+    const DEFAULT_CSV_URL = "https://the-ashcombe-school.uk.arbor.sc/data-export/export/id/394/h/3137b9ccebf1d86d/format/json/v/2/";
+    const ADMIN_PIN = "9833";
+    const DEFAULT_WEEK_A_START = "2026-05-11";
+
+    const periods = [
+      { period: "Period 1", time: "09:20 - 10:30", start: "09:20", end: "10:30", periodNumber: "1" },
+      { period: "Period 2", time: "10:35 - 11:45", start: "10:35", end: "11:45", periodNumber: "2" },
+      { period: "Period 3", time: "12:15 - 13:25", start: "12:15", end: "13:25", periodNumber: "3" },
+      { period: "Period 4", time: "14:05 - 15:15", start: "14:05", end: "15:15", periodNumber: "4" },
+    ];
+
+    const dayOptions = [
+      { label: "Monday", shortLabel: "Mon", code: "M" },
+      { label: "Tuesday", shortLabel: "Tues", code: "T" },
+      { label: "Wednesday", shortLabel: "Wed", code: "W" },
+      { label: "Thursday", shortLabel: "Thurs", code: "Th" },
+      { label: "Friday", shortLabel: "Fri", code: "F" },
+    ];
+
+    const fallbackTimetableData = [
+      {
+        id: "Khan|Aisha|13Va|0",
+        fullName: "Aisha Khan",
+        firstName: "Aisha",
+        surname: "Khan",
+        registration: "13Va",
+        timetable: {},
+        lessons: [
+          { period: "Period 1", subject: "Maths", room: "R1" },
+          { period: "Period 2", subject: "English", room: "R8" },
+          { period: "Period 3", subject: "Science", room: "LAB 2" },
+          { period: "Period 4", subject: "History", room: "R23" },
+        ],
+      },
+    ];
+
+    function cleanText(value) {
+      return String(value ?? "").replace(/^\uFEFF/, "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    function normaliseHeader(value) {
+      return cleanText(value).toLowerCase().replace(/[^a-z0-9]/g, "");
+    }
+
+    function getDefaultDayCode(date) {
+      return { 1: "M", 2: "T", 3: "W", 4: "Th", 5: "F" }[date.getDay()] || "M";
+    }
+
+    function getDayLabel(dayCode) {
+      return dayOptions.find((day) => day.code === dayCode)?.shortLabel || dayCode;
+    }
+
+    function getWeekLabel(weekNumber) {
+      return weekNumber === 1 ? "A" : "B";
+    }
+
+    function getArborEventHeader(periodNumber) {
+      return `P${periodNumber} - Event`;
+    }
+
+    function getArborLocationHeader(periodNumber) {
+      return `P${periodNumber} - Location`;
+    }
+
+    function getMondayKey(date) {
+      const monday = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+      const day = monday.getDay();
+      monday.setDate(monday.getDate() + (day === 0 ? -6 : 1 - day));
+      return monday.toISOString().slice(0, 10);
+    }
+
+    function getMondaysForYear(year) {
+      const mondays = [];
+      const date = new Date(year, 0, 1);
+      date.setDate(date.getDate() + ((8 - date.getDay()) % 7));
+      while (date.getFullYear() === year) {
+        mondays.push(new Date(date));
+        date.setDate(date.getDate() + 7);
+      }
+      return mondays;
+    }
+
+    function buildDefaultWeekAMondays(year, weekAStartDate = DEFAULT_WEEK_A_START) {
+      const weekAStart = new Date(`${weekAStartDate}T00:00:00`);
+      return getMondaysForYear(year).reduce((selected, monday) => {
+        if (Number.isNaN(weekAStart.getTime())) return selected;
+        const diffDays = Math.floor((monday.getTime() - weekAStart.getTime()) / 86400000);
+        if (Math.abs(Math.floor(diffDays / 7)) % 2 === 0) selected[getMondayKey(monday)] = true;
+        return selected;
+      }, {});
+    }
+
+    function getAutoWeekNumber(date, weekAMondayMap) {
+      return weekAMondayMap?.[getMondayKey(date)] ? 1 : 2;
+    }
+
+    function detectDelimiter(text) {
+      const firstLine = String(text || "").split(/\r?\n/)[0] || "";
+      return (firstLine.match(/\t/g) || []).length > (firstLine.match(/,/g) || []).length ? "\t" : ",";
+    }
+
+    function buildRowObject(headers, cells, delimiter) {
+      const obj = { __headers: headers, __cells: cells, __delimiter: delimiter };
+      headers.forEach((header, index) => {
+        const uniqueHeader = obj[header] === undefined ? header : `${header}__${index}`;
+        obj[uniqueHeader] = cells[index] || "";
+      });
+      return obj;
+    }
+
+    function extractJsonCellValue(value) {
+      if (value === null || value === undefined) return "";
+      if (typeof value !== "object") return cleanText(value);
+      for (const key of ["value", "display_value", "displayValue", "text", "label", "name", "title"]) {
+        if (value[key] !== undefined && value[key] !== null) return cleanText(value[key]);
+      }
+      return cleanText(JSON.stringify(value));
+    }
+
+    function normaliseJsonRows(value) {
+      if (Array.isArray(value)) return { rows: value, headers: [] };
+      const rows = ["data", "rows", "results", "items", "records"].reduce((found, key) => found || (Array.isArray(value?.[key]) ? value[key] : null), null) || [];
+      const rawHeaders = ["columns", "fields", "headers", "headings"].reduce((found, key) => found || (Array.isArray(value?.[key]) ? value[key] : null), null) || [];
+      const headers = rawHeaders.map((header, index) => typeof header === "string" ? cleanText(header) : cleanText(header?.label || header?.name || header?.title || header?.key || header?.id || `Column ${index + 1}`));
+      return { rows, headers };
+    }
+
+    function parseJsonText(text) {
+      const parsed = JSON.parse(text);
+      const { rows, headers: suppliedHeaders } = normaliseJsonRows(parsed);
+      return rows.map((row) => {
+        const isArrayRow = Array.isArray(row);
+        if (!isArrayRow && suppliedHeaders.length) {
+          const rawKeys = Object.keys(row || {});
+          const cells = suppliedHeaders.map((header, index) => row[header] !== undefined ? extractJsonCellValue(row[header]) : extractJsonCellValue(row[rawKeys[index]]));
+          return buildRowObject(suppliedHeaders, cells, "json");
+        }
+        const headers = isArrayRow ? (suppliedHeaders.length ? suppliedHeaders : row.map((_, index) => `Column ${index + 1}`)) : Object.keys(row || {}).map(cleanText);
+        const cells = headers.map((header, index) => isArrayRow ? extractJsonCellValue(row[index]) : extractJsonCellValue(row[header]));
+        return buildRowObject(headers, cells, "json");
+      });
+    }
+
+    function parseDelimitedText(text) {
+      const delimiter = detectDelimiter(text);
+      const rows = [];
+      let currentRow = [];
+      let currentCell = "";
+      let insideQuotes = false;
+      for (let i = 0; i < text.length; i += 1) {
+        const char = text[i];
+        const nextChar = text[i + 1];
+        if (char === '"' && insideQuotes && nextChar === '"') {
+          currentCell += '"';
+          i += 1;
+        } else if (char === '"') {
+          insideQuotes = !insideQuotes;
+        } else if (char === delimiter && !insideQuotes) {
+          currentRow.push(currentCell);
+          currentCell = "";
+        } else if ((char === "\n" || char === "\r") && !insideQuotes) {
+          if (char === "\r" && nextChar === "\n") i += 1;
+          currentRow.push(currentCell);
+          if (currentRow.some((cell) => cleanText(cell))) rows.push(currentRow);
+          currentRow = [];
+          currentCell = "";
+        } else {
+          currentCell += char;
+        }
+      }
+      currentRow.push(currentCell);
+      if (currentRow.some((cell) => cleanText(cell))) rows.push(currentRow);
+      if (rows.length < 2) return [];
+      const headers = rows[0].map(cleanText);
+      return rows.slice(1).map((row) => buildRowObject(headers, row.map(cleanText), delimiter));
+    }
+
+    function parseSourceText(text) {
+      const trimmed = String(text || "").trim();
+      return trimmed.startsWith("{") || trimmed.startsWith("[") ? parseJsonText(trimmed) : parseDelimitedText(text);
+    }
+
+    function findHeaderValue(row, headerName) {
+      const headers = Array.isArray(row.__headers) ? row.__headers : [];
+      const cells = Array.isArray(row.__cells) ? row.__cells : [];
+      const target = normaliseHeader(headerName);
+      const index = headers.findIndex((header) => normaliseHeader(header) === target);
+      return index >= 0 ? cleanText(cells[index]) : "";
+    }
+
+    function findValue(row, possibleKeys) {
+      const headers = Array.isArray(row.__headers) ? row.__headers : [];
+      const cells = Array.isArray(row.__cells) ? row.__cells : [];
+      const normalisedKeys = possibleKeys.map(normaliseHeader);
+      for (let index = 0; index < headers.length; index += 1) {
+        const normalisedHeader = normaliseHeader(headers[index]);
+        if (normalisedKeys.some((key) => normalisedHeader === key || normalisedHeader.startsWith(key))) return cleanText(cells[index]);
+      }
+      return "";
+    }
+
+    function findExactValue(row, possibleKeys) {
+      const headers = Array.isArray(row.__headers) ? row.__headers : [];
+      const cells = Array.isArray(row.__cells) ? row.__cells : [];
+      const normalisedKeys = possibleKeys.map(normaliseHeader);
+      for (let index = 0; index < headers.length; index += 1) {
+        if (normalisedKeys.includes(normaliseHeader(headers[index]))) return cleanText(cells[index]);
+      }
+      return "";
+    }
+
+    function extractRoom(value) {
+      return cleanText(value).replace(/^The Ashcombe School:\s*/i, "") || "—";
+    }
+
+    function convertRowsToTimetable(rows) {
+      return rows.map((row, index) => {
+        const firstName = findValue(row, ["First Name", "Forename", "Preferred First Name"]);
+        const surname = findValue(row, ["Surname", "Last Name", "Family Name"]);
+        let fullName = findExactValue(row, ["Full Name", "Student", "Student Name"]);
+        if (!fullName) fullName = firstName && surname ? `${firstName} ${surname}` : firstName || surname;
+        const registration = findValue(row, ["Registration form(s) today", "Registration", "Reg", "Tutor Group", "Form"]);
+        const timetable = {
+          current: periods.map((period) => ({
+            period: period.period,
+            subject: findHeaderValue(row, getArborEventHeader(period.periodNumber)),
+            room: extractRoom(findHeaderValue(row, getArborLocationHeader(period.periodNumber))),
+          })),
+        };
+        const legacyLessons = periods.map((period) => ({
+          period: period.period,
+          subject: findValue(row, [`P${period.periodNumber}`, `Period ${period.periodNumber}`]),
+          room: extractRoom(findValue(row, [`Room${period.periodNumber}`, `P${period.periodNumber} Room`, `Period ${period.periodNumber} Room`])),
+        }));
+        const cleanFirstName = cleanText(firstName);
+        const cleanSurname = cleanText(surname);
+        const cleanFullName = cleanText(fullName);
+        return { id: `${cleanSurname}|${cleanFirstName}|${registration}|${index}`, fullName: cleanFullName, firstName: cleanFirstName, surname: cleanSurname, registration, timetable, lessons: legacyLessons };
+      }).filter((student) => student.fullName);
+    }
+
+    function splitName(fullName) {
+      const parts = cleanText(fullName).split(" ").filter(Boolean);
+      return { firstName: parts.slice(0, -1).join(" ") || parts[0] || "", surname: parts.length > 1 ? parts.slice(-1).join("") : "" };
+    }
+
+    function getStudents(data) {
+      return (Array.isArray(data) ? data : [])
+        .filter((student) => student && (student.id || student.fullName))
+        .map((student) => {
+          const fallback = splitName(student.fullName);
+          const firstName = cleanText(student.firstName || fallback.firstName);
+          const surname = cleanText(student.surname || fallback.surname);
+          const registration = cleanText(student.registration || "No registration");
+          return {
+            value: student.id || student.fullName,
+            label: surname && firstName ? `${surname}, ${firstName}` : student.fullName,
+            searchText: `${student.fullName} ${surname} ${firstName} ${registration}`.toLowerCase(),
+            surname,
+            registration,
+          };
+        })
+        .sort((a, b) => a.registration.localeCompare(b.registration) || a.surname.localeCompare(b.surname) || a.label.localeCompare(b.label));
+    }
+
+    function groupStudentsByRegistration(students) {
+      return (Array.isArray(students) ? students : []).reduce((groups, student) => {
+        const groupName = student?.registration || "No registration";
+        if (student) groups[groupName] = [...(groups[groupName] || []), student];
+        return groups;
+      }, {});
+    }
+
+    function getStudentRecord(studentId, data) {
+      return (Array.isArray(data) ? data : []).find((item) => item && (item.id || item.fullName) === studentId) || null;
+    }
+
+    function getSelectedLessons(studentId, data, weekNumber, dayCode, date = new Date()) {
+      const day = date.getDay();
+      if (day === 0 || day === 6) return periods.map((period) => ({ period: period.period, time: period.time, subject: "Weekend", room: "—", isFree: true }));
+      const student = getStudentRecord(studentId, data);
+      const selectedLessons = student?.timetable?.current || [];
+      const fallbackLessons = student?.lessons || [];
+      const lessonSource = selectedLessons.some((lesson) => cleanText(lesson.subject)) ? selectedLessons : fallbackLessons;
+      return periods.map((period) => {
+        const lesson = lessonSource.find((item) => item?.period === period.period);
+        return { period: period.period, time: period.time, subject: lesson?.subject || "No lesson / study period", room: lesson?.room || "—", isFree: !lesson?.subject };
+      });
+    }
+
+    function getHasAnyRealLesson(lessons) {
+      return (Array.isArray(lessons) ? lessons : []).some((lesson) => !lesson?.isFree && cleanText(lesson?.subject));
+    }
+
+    function minutesFromTime(value) {
+      const [h, m] = String(value || "0:0").split(":").map(Number);
+      return (h || 0) * 60 + (m || 0);
+    }
+
+    function getCurrentPeriod(date) {
+      const mins = date.getHours() * 60 + date.getMinutes();
+      return periods.find((p) => mins >= minutesFromTime(p.start) && mins <= minutesFromTime(p.end)) || null;
+    }
+
+    function getNextPeriod(date) {
+      const mins = date.getHours() * 60 + date.getMinutes();
+      return periods.find((p) => minutesFromTime(p.start) > mins) || null;
+    }
+
+    function getMinutesUntilPeriod(date, period) {
+      return period ? Math.max(0, minutesFromTime(period.start) - (date.getHours() * 60 + date.getMinutes())) : null;
+    }
+
+    function formatCountdown(minutes) {
+      if (minutes === null) return "No more lessons today";
+      if (minutes === 0) return "starting now";
+      return minutes === 1 ? "in 1 minute" : `in ${minutes} minutes`;
+    }
+
+    function getSubjectStyle(subject) {
+      const normalised = cleanText(subject).toLowerCase();
+      if (normalised === "weekend") return "bg-[#fdf0f0] border-[#c32032]";
+      if (!normalised || normalised.includes("no lesson") || normalised.includes("study")) return "bg-[#f7f7f8] border-[#e5e5e5]";
+      if (normalised.includes("math")) return "bg-[#f0fdf4] border-[#86efac]";
+      if (normalised.includes("english")) return "bg-[#f8fafc] border-[#cbd5e1]";
+      if (normalised.includes("science") || normalised.includes("biology") || normalised.includes("chemistry") || normalised.includes("physics")) return "bg-[#ecfdf5] border-[#99f6e4]";
+      if (normalised.includes("history") || normalised.includes("geography")) return "bg-[#fffbeb] border-[#fde68a]";
+      return "bg-white border-[#e5e7eb]";
+    }
+
+    function formatDate(date) {
+      return new Intl.DateTimeFormat("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" }).format(date);
+    }
+
+    function formatTime(date) {
+      return new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
+    }
+
+    const inputClass = "h-12 w-full rounded-xl border-2 border-stone-300 bg-white px-3 text-sm outline-none focus:border-[#c32032]";
+    const buttonClass = "rounded-xl bg-[#202123] px-3 py-2 text-sm font-semibold text-white shadow hover:bg-[#343541]";
+    const paleButtonClass = "rounded-xl border-2 border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-[#202123] hover:bg-[#f4f7f1]";
+
+    function Panel({ children, className = "" }) {
+      return <section className={`rounded-[28px] border-4 border-[#c32032] bg-white p-2 shadow-sm ${className}`}><div className="rounded-[20px] border border-[#d9d9d9] p-3">{children}</div></section>;
+    }
+
+    function InfoTile({ label, value, dark = false, green = false }) {
+      const style = dark ? "bg-[#003b5c] text-white" : green ? "bg-[#e7f4d8] text-[#2f5d1c]" : "bg-[#f4f7f1]";
+      return <div className={`rounded-xl p-2 ${style}`}><p className="text-xs font-bold uppercase opacity-80">{label}</p><p className="text-sm font-semibold">{value}</p></div>;
+    }
+
+    function LessonCard({ lesson, isCurrent }) {
+      const cardClass = isCurrent ? "current-lesson-pulse bg-gradient-to-br from-[#003b5c] to-[#005b8f] text-white ring-4 ring-[#c32032]" : getSubjectStyle(lesson.subject);
+      return <article className={`flex min-h-[170px] flex-col items-center justify-center rounded-xl border-2 p-3 text-center ${cardClass}`}><p className="text-base font-semibold">{lesson.period}{isCurrent ? " • Current" : ""}</p><span className="my-3 rounded-full bg-white px-3 py-1 text-xs font-medium text-[#003b5c] shadow-sm">{lesson.time}</span><h3 className="text-2xl font-extrabold leading-tight">{lesson.subject}</h3><p className="mt-2 text-lg font-semibold">📍 {lesson.room}</p></article>;
+    }
+
+    function PinModal({ adminPin, setAdminPin, adminError, closePinModal, handleToolsButton }) {
+      return <><button type="button" aria-label="Close PIN popup" onClick={closePinModal} className="fixed inset-0 z-40 bg-black/40" /><div className="fixed inset-0 z-50 flex items-center justify-center p-4"><div className="w-full max-w-sm rounded-[28px] border-4 border-[#c32032] bg-white p-6 shadow-2xl"><div className="mb-4 text-center"><img src="https://www.surreydownspartnership.org.uk/i/New-Ashcombe-Logo-Full-Colour-600px.png" alt="Ashcombe logo" className="mx-auto mb-3 h-16 rounded-2xl bg-white p-1 shadow-md" /><p className="text-xs font-bold uppercase tracking-[0.3em] text-[#c32032]">Admin access</p><h2 className="mt-1 text-2xl font-bold text-[#202123]">Enter PIN</h2></div><input aria-label="Admin PIN" type="password" value={adminPin} onChange={(event) => setAdminPin(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") handleToolsButton(); }} placeholder="Enter admin PIN" className="h-14 w-full rounded-2xl border-2 border-stone-300 px-4 text-center text-xl tracking-[0.4em] outline-none focus:border-[#c32032]" autoFocus />{adminError && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-center text-sm font-semibold text-amber-900">{adminError}</p>}<div className="mt-4 flex gap-2"><button type="button" onClick={closePinModal} className={`${paleButtonClass} flex-1`}>Cancel</button><button type="button" onClick={handleToolsButton} className={`${buttonClass} flex-1`}>Unlock</button></div></div></div></>;
+    }
+
+    function AdminDrawer({ currentYear, mondaysForYear, weekAMondays, setWeekAMondays, handleFile, csvUrl, setCsvUrl, loadCsvFromUrl, isLoading, resetToSampleData, showDebug, setShowDebug, error, status, lastUpdated, debugInfo, close }) {
+      return <><button type="button" aria-label="Close admin tools" onClick={close} className="fixed inset-0 z-40 cursor-default bg-black/30" /><aside className="fixed right-0 top-0 z-50 h-screen w-full max-w-md overflow-y-auto border-l-4 border-[#c32032] bg-white p-5 shadow-2xl"><div className="mb-4 flex items-start justify-between gap-3 border-b pb-3"><div><p className="text-xs font-bold uppercase tracking-[0.25em] text-[#c32032]">Admin tools</p><h2 className="text-xl font-bold text-[#202123]">Settings drawer</h2><p className="text-sm text-[#6a7b87]">Live data, upload, debug and Week A pattern.</p></div><button type="button" onClick={close} className={buttonClass}>Close</button></div><div className="grid gap-4"><section className="rounded-2xl border border-stone-200 bg-[#f4f7f1] p-3"><div className="mb-2 flex items-center justify-between gap-2"><div><p className="font-semibold">Week A Mondays for {currentYear}</p><p className="text-xs text-[#6a7b87]">Tick each Monday that should be Week A.</p></div><button type="button" onClick={() => setWeekAMondays(buildDefaultWeekAMondays(currentYear))} className={paleButtonClass}>Reset</button></div><div className="grid max-h-48 gap-2 overflow-auto sm:grid-cols-2">{mondaysForYear.map((monday) => { const key = getMondayKey(monday); const checked = Boolean(weekAMondays[key]); return <label key={key} className={`rounded-xl border p-2 text-sm font-semibold ${checked ? "border-[#c32032] bg-[#fdf0f0] text-[#8f1d1d]" : "border-stone-200 bg-white"}`}><input type="checkbox" checked={checked} onChange={(event) => setWeekAMondays((current) => ({ ...current, [key]: event.target.checked }))} /> {new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short" }).format(monday)}</label>; })}</div></section><section className="rounded-2xl border border-stone-200 p-3"><label className="mb-2 block text-xs font-bold uppercase tracking-wide">Upload CSV, TSV or JSON</label><input type="file" accept=".csv,text/csv,.tsv,text/tab-separated-values,.json,application/json" onChange={handleFile} className="w-full rounded-xl border bg-white p-3 text-sm" /></section><section className="rounded-2xl border border-stone-200 p-3"><label className="mb-2 block text-xs font-bold uppercase tracking-wide">Live data link</label><textarea value={csvUrl} onChange={(event) => setCsvUrl(event.target.value)} rows={4} className="w-full rounded-xl border border-stone-300 bg-white p-3 text-xs outline-none focus:border-[#c32032]" /><button type="button" onClick={() => loadCsvFromUrl()} disabled={isLoading} className={`${buttonClass} mt-2 w-full`}>{isLoading ? "Loading..." : "Load live link"}</button></section><section className="rounded-2xl border border-stone-200 p-3"><div className="flex flex-wrap gap-2"><button type="button" onClick={resetToSampleData} className={paleButtonClass}>Reset to sample data</button><button type="button" onClick={() => setShowDebug((value) => !value)} className={paleButtonClass}>{showDebug ? "Hide debug" : "Show debug"}</button></div></section>{error && <p className="whitespace-pre-line rounded-xl border-l-4 border-amber-500 bg-amber-50 p-3 text-sm text-amber-900">{error}</p>}<section className="rounded-xl border-l-4 border-[#c32032] bg-[#fdf0f0] p-3 text-sm text-[#8f1d1d]"><p className="font-semibold">{status}</p><p>{lastUpdated ? `Last updated: ${formatTime(lastUpdated)}` : "Not loaded from live data yet."}</p></section>{showDebug && <section className="rounded-xl bg-[#f4f7f1] p-3 text-sm"><p><strong>Detected delimiter:</strong> {debugInfo.delimiter}</p><p><strong>Students loaded:</strong> {debugInfo.studentCount}</p><p className="mt-2 max-h-28 overflow-auto rounded bg-white p-2 text-xs">{debugInfo.headers.length ? debugInfo.headers.join(" | ") : "No file headers loaded yet."}</p></section>}</div></aside></>;
+    }
+
+    function StudentTimetableApp() {
+      const [data, setData] = useState(fallbackTimetableData);
+      const [student, setStudent] = useState("");
+      const [now, setNow] = useState(() => new Date());
+      const [csvUrl, setCsvUrl] = useState(DEFAULT_CSV_URL);
+      const [error, setError] = useState("");
+      const [status, setStatus] = useState("Using sample data");
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [isLoading, setIsLoading] = useState(false);
+      const [searchTerm, setSearchTerm] = useState("");
+      const [selectedTutorGroup, setSelectedTutorGroup] = useState("All");
+      const [debugInfo, setDebugInfo] = useState({ delimiter: "sample", studentCount: fallbackTimetableData.length, headers: [] });
+      const [showDebug, setShowDebug] = useState(false);
+      const [showAdminTools, setShowAdminTools] = useState(false);
+      const [showPinModal, setShowPinModal] = useState(false);
+      const [adminPin, setAdminPin] = useState("");
+      const [adminError, setAdminError] = useState("");
+      const [weekAMondays, setWeekAMondays] = useState(() => buildDefaultWeekAMondays(new Date().getFullYear()));
+
+      const selectedDayCode = getDefaultDayCode(now);
+      const currentYear = now.getFullYear();
+      const mondaysForYear = useMemo(() => getMondaysForYear(currentYear), [currentYear]);
+      const students = useMemo(() => getStudents(data), [data]);
+      const tutorGroups = useMemo(() => Array.from(new Set(students.map((item) => item.registration || "No registration"))).sort(), [students]);
+      const filteredStudents = useMemo(() => {
+        const query = searchTerm.toLowerCase().trim();
+        return students.filter((item) => (selectedTutorGroup === "All" || item.registration === selectedTutorGroup) && (!query || item.searchText.includes(query)));
+      }, [searchTerm, selectedTutorGroup, students]);
+      const groupedFilteredStudents = useMemo(() => groupStudentsByRegistration(filteredStudents), [filteredStudents]);
+      const currentPeriod = getCurrentPeriod(now);
+      const nextPeriod = getNextPeriod(now);
+      const currentWeek = getAutoWeekNumber(now, weekAMondays);
+      const selectedDayIsToday = now.getDay() >= 1 && now.getDay() <= 5;
+      const selectedRecord = getStudentRecord(student, data);
+      const lessons = getSelectedLessons(student, data, currentWeek, selectedDayCode, now);
+      const scheduledLessons = lessons.filter((lesson) => !lesson.isFree);
+      const hasAnyRealLesson = getHasAnyRealLesson(lessons);
+
+      useEffect(() => {
+        if (!student && filteredStudents.length > 0) setStudent(filteredStudents[0].value);
+        if (student && filteredStudents.length > 0 && !filteredStudents.some((item) => item.value === student)) setStudent(filteredStudents[0].value);
+      }, [student, filteredStudents]);
+
+      useEffect(() => {
+        const timer = window.setInterval(() => setNow(new Date()), 1000);
+        return () => window.clearInterval(timer);
+      }, []);
+
+      useEffect(() => {
+        loadCsvFromUrl({ silent: true });
+        const timer = window.setInterval(() => loadCsvFromUrl({ silent: true, preserveSelection: true }), 600000);
+        return () => window.clearInterval(timer);
+      }, []);
+
+      function loadRows(rows, sourceName, rawText = "", preserveSelection = false) {
+        const timetable = convertRowsToTimetable(rows);
+        if (timetable.length === 0) throw new Error("No students were found in the CSV/TSV/JSON file.");
+        const list = getStudents(timetable);
+        setData(timetable);
+        setStudent((current) => (preserveSelection && list.some((item) => item.value === current) ? current : list[0]?.value || ""));
+        setLastUpdated(new Date());
+        setStatus(`${sourceName} — loaded ${timetable.length} student${timetable.length === 1 ? "" : "s"}`);
+        setDebugInfo({ delimiter: rawText ? (String(rawText).trim().startsWith("{") || String(rawText).trim().startsWith("[") ? "json" : detectDelimiter(rawText) === "\t" ? "tab-separated" : "comma-separated") : "unknown", studentCount: timetable.length, headers: rows[0]?.__headers || [] });
+        setError("");
+      }
+
+      function resetToSampleData() {
+        setData(fallbackTimetableData);
+        setStudent(fallbackTimetableData[0].id);
+        setSearchTerm("");
+        setSelectedTutorGroup("All");
+        setStatus("Using sample data");
+        setLastUpdated(null);
+        setDebugInfo({ delimiter: "sample", studentCount: fallbackTimetableData.length, headers: [] });
+        setError("");
+      }
+
+      function handleFile(event) {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (readerEvent) => {
+          try {
+            const text = String(readerEvent.target?.result || "");
+            loadRows(parseSourceText(text), `Loaded file: ${file.name}`, text);
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "Could not read the file.");
+          }
+        };
+        reader.onerror = () => setError("Could not read the selected file.");
+        reader.readAsText(file);
+      }
+
+      async function loadCsvFromUrl(options = {}) {
+        if (!options.silent) setIsLoading(true);
+        setError("");
+        try {
+          const response = await fetch(csvUrl, { cache: "no-store", credentials: "omit" });
+          if (!response.ok) throw new Error(`Link returned status ${response.status}.`);
+          const text = await response.text();
+          const lower = text.trim().toLowerCase();
+          if (lower.startsWith("<!doctype") || lower.includes("<html")) throw new Error("This link returned a web page, not raw CSV/TSV/JSON data.");
+          loadRows(parseSourceText(text), options.silent ? "Auto-refreshed from live Arbor link" : "Loaded from live Arbor link", text, Boolean(options.preserveSelection));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Could not load link.";
+          setError(`${message}\n\nThe live Arbor link may be blocked by browser permissions or CORS. Try downloading the export, then use the file upload button.`);
+        } finally {
+          if (!options.silent) setIsLoading(false);
+        }
+      }
+
+      function resetSearch() {
+        setSearchTerm("");
+        setSelectedTutorGroup("All");
+        setStudent(students[0]?.value || "");
+      }
+
+      function closePinModal() {
+        setShowPinModal(false);
+        setAdminPin("");
+        setAdminError("");
+      }
+
+      function handleToolsButton() {
+        if (showAdminTools) {
+          setShowAdminTools(false);
+          setAdminPin("");
+          setAdminError("");
+          return;
+        }
+        if (adminPin === ADMIN_PIN) {
+          setShowAdminTools(true);
+          setShowPinModal(false);
+          setAdminPin("");
+          setAdminError("");
+          return;
+        }
+        setAdminError("Incorrect PIN.");
+      }
+
+      return (
+        <main className="h-screen overflow-y-auto bg-[#f7f7f8] text-[#202123]">
+          <style>{`@keyframes pulseNow{0%{transform:scale(1)}50%{transform:scale(1.02)}100%{transform:scale(1)}}.current-lesson-pulse{animation:pulseNow 2.6s ease-in-out infinite}`}</style>
+
+          <header className="bg-gradient-to-r from-[#003b5c] to-[#005b8f] text-white">
+            <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-3">
+              <div className="flex items-center gap-3">
+                <button type="button" aria-label="Open admin login" onClick={() => { setShowPinModal(true); setAdminError(""); }} className="rounded-2xl transition hover:scale-105 hover:shadow-lg focus:outline-none focus:ring-4 focus:ring-white/30">
+                  <img src="https://www.surreydownspartnership.org.uk/i/New-Ashcombe-Logo-Full-Colour-600px.png" alt="The Ashcombe School logo" className="h-12 rounded-xl bg-white p-1" />
+                </button>
+                <div>
+                  <div className="text-lg font-semibold">The Ashcombe School</div>
+                  <div className="text-xs text-slate-200">Student Timetable System</div>
+                </div>
+              </div>
+              <div className="hidden gap-2 text-xs font-semibold uppercase md:flex"><span>Student Services</span><span>Timetable</span></div>
+            </div>
+          </header>
+
+          <div className="h-1 bg-[#c32032]" />
+
+          <section className="border-b bg-white shadow-sm">
+            <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.25em] text-[#c32032]">Student Services</p>
+                <h1 className="text-2xl font-bold">Timetable: {getDayLabel(selectedDayCode)} Week {getWeekLabel(currentWeek)}</h1>
+              </div>
+              {showAdminTools && <button type="button" onClick={handleToolsButton} className={buttonClass}>Hide tools</button>}
+            </div>
+          </section>
+
+          <div className="mx-auto flex max-w-7xl flex-col gap-3 p-3">
+            {showPinModal && <PinModal adminPin={adminPin} setAdminPin={setAdminPin} adminError={adminError} closePinModal={closePinModal} handleToolsButton={handleToolsButton} />}
+            {adminError && !showAdminTools && !showPinModal && <div className="rounded-xl border-l-4 border-amber-500 bg-amber-50 p-3 text-sm font-semibold text-amber-900">{adminError}</div>}
+
+            <Panel className="p-3">
+              <div className="grid gap-3 lg:grid-cols-3">
+                <label className="text-xs font-semibold uppercase">Search student<input value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder="Type surname, first name, or form" className={inputClass} /></label>
+                <label className="text-xs font-semibold uppercase">Tutor group<select value={selectedTutorGroup} onChange={(event) => setSelectedTutorGroup(event.target.value)} className={inputClass}><option value="All">All tutor groups</option>{tutorGroups.map((group) => <option key={group} value={group}>{group}</option>)}</select></label>
+                <label className="text-xs font-semibold uppercase">Student<select value={student} onChange={(event) => setStudent(event.target.value)} className={inputClass}>{Object.entries(groupedFilteredStudents).map(([registration, group]) => <optgroup key={registration} label={registration}>{group.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</optgroup>)}</select></label>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-center md:grid-cols-4">
+                <InfoTile label="Date" value={formatDate(now)} />
+                <InfoTile label="Time" value={formatTime(now)} />
+                <InfoTile label="Now" value={selectedDayIsToday ? (currentPeriod ? currentPeriod.period.replace("Period ", "P") : "Break") : "Selected day"} dark />
+                <InfoTile label="Next" value={selectedDayIsToday ? (nextPeriod ? `${nextPeriod.period.replace("Period ", "P")} ${formatCountdown(getMinutesUntilPeriod(now, nextPeriod))}` : "Done") : getDayLabel(selectedDayCode)} green />
+              </div>
+              <div className="mt-3"><button type="button" onClick={resetSearch} className={paleButtonClass}>Reset search</button></div>
+            </Panel>
+
+            {showAdminTools && <AdminDrawer currentYear={currentYear} mondaysForYear={mondaysForYear} weekAMondays={weekAMondays} setWeekAMondays={setWeekAMondays} handleFile={handleFile} csvUrl={csvUrl} setCsvUrl={setCsvUrl} loadCsvFromUrl={loadCsvFromUrl} isLoading={isLoading} resetToSampleData={resetToSampleData} showDebug={showDebug} setShowDebug={setShowDebug} error={error} status={status} lastUpdated={lastUpdated} debugInfo={debugInfo} close={() => setShowAdminTools(false)} />}
+
+            <Panel className="p-3">
+              {!hasAnyRealLesson && data !== fallbackTimetableData && <div className="mb-2 rounded-xl border-l-4 border-amber-500 bg-amber-50 p-3 text-sm font-semibold text-amber-900">No lessons found. Expected headers like P1 - Event and P1 - Location.</div>}
+              <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between"><div><p className="text-xl font-bold">{selectedRecord?.fullName || "Select a student"}</p><p className="text-sm text-[#6a7b87]">{selectedRecord?.registration ? `Registration: ${selectedRecord.registration}` : ""} • Showing {filteredStudents.length} of {students.length} students</p></div><p className="text-sm text-[#6a7b87]">{scheduledLessons.length} scheduled lesson(s)</p></div>
+              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                {lessons.map((lesson) => <LessonCard key={lesson.period} lesson={lesson} isCurrent={selectedDayIsToday && currentPeriod?.period === lesson.period} />)}
+              </div>
+            </Panel>
+          </div>
+        </main>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<StudentTimetableApp />);
+  </script>
+</body>
+</html>
+
+
